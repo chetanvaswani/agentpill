@@ -1279,6 +1279,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                                object: nil, queue: .main) { [weak self] _ in
             self?.layout(animated: false)
         }
+        // .canJoinAllSpaces alone doesn't carry the panel into full-screen Spaces created or entered
+        // after it was shown; re-ordering it on every Space or app switch does.
+        let ws = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.activeSpaceDidChangeNotification, NSWorkspace.didActivateApplicationNotification] {
+            ws.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                guard let self, self.panel.isVisible else { return }
+                self.panel.orderFrontRegardless()
+            }
+        }
 
         let server = Server { [weak self] event in self?.receive(event) }
         self.server = server
