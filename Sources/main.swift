@@ -141,11 +141,30 @@ final class Store {
     enum Change { case none, now, later }
 
     private(set) var sessions: [String: Session] = [:]
+    /// Sessions the person hid with ×, and the state each was in. A session stays hidden only while it
+    /// keeps that state, so a hidden agent comes back when it needs you or finishes.
+    private(set) var hidden: [String: PillState] = [:]
+
+    func hide(_ id: String) -> Bool {
+        guard let s = sessions[id] else { return false }
+        hidden[id] = s.state
+        return true
+    }
+
+    func showHidden() -> Bool {
+        defer { hidden.removeAll() }
+        return !hidden.isEmpty
+    }
+
+    /// Forgets hides whose session has ended or moved on to another state.
+    func pruneHidden() {
+        hidden = hidden.filter { id, state in sessions[id]?.state == state }
+    }
 
     /// Most urgent first, labelled by session name (falling back to the project folder).
     var ordered: [Session] {
         var byName: [String: [Session]] = [:]
-        for s in sessions.values {
+        for s in sessions.values where hidden[s.id] != s.state {
             var name = s.title ?? s.project
             if name.count > 30 { name = String(name.prefix(29)) + "…" }
             byName[name, default: []].append(s)
@@ -169,7 +188,10 @@ final class Store {
         return true
     }
 
-    func remove(_ id: String) -> Bool { sessions.removeValue(forKey: id) != nil }
+    func remove(_ id: String) -> Bool {
+        hidden[id] = nil
+        return sessions.removeValue(forKey: id) != nil
+    }
 
     func set(_ id: String, project: String = "", state: PillState, text: String) -> Bool {
         var s = sessions[id] ?? Session(id: id)
@@ -186,7 +208,7 @@ final class Store {
         return true
     }
 
-    func clearAll() { sessions.removeAll() }
+    func clearAll() { sessions.removeAll(); hidden.removeAll() }
 
     func handle(_ e: [String: Any]) -> Change {
         guard let event = e["hook_event_name"] as? String else { return .none }
@@ -800,7 +822,7 @@ final class PillView: NSView {
     var onHover: ((Bool) -> Void)?
     var onDrag: ((NSPoint?) -> Void)?   // offset from drag start; nil when the drag ends
     var menuProvider: (() -> NSMenu)?
-    var onDismiss: ((String) -> Void)?  // "viewed" tick clicked on a finished row
+    var onDismiss: ((String) -> Void)?  // tick on a finished row, or × on a working/waiting one
     var onOpen: ((String) -> Void)?     // anywhere else on a row: bring that session's app forward
 
     let margin: CGFloat = 16
@@ -816,6 +838,7 @@ final class PillView: NSView {
     private var checkRects: [(rect: NSRect, id: String)] = []
     private var rowRects: [(rect: NSRect, id: String)] = []
     private var hoverRow: String?
+    private var hoverButton: String?
     private var dragStart: NSPoint?
     private var dragMoved = false
 
@@ -844,6 +867,9 @@ final class PillView: NSView {
     private var radius: CGFloat { docked ? 14 : min(15, pillRect.height / 2) }
 
     private func dismissible(_ s: Session) -> Bool { s.state == .done || s.state == .idle }
+    /// Working and waiting rows get a × to hide them, shown only while the pill is expanded on hover.
+    private func hideable(_ s: Session) -> Bool { expanded && !dismissible(s) }
+    private func hasButton(_ s: Session) -> Bool { dismissible(s) || hideable(s) }
 
     /// Collapsed: one line per agent that is working or waiting (up to 4). Expanded: everything.
     private var visible: [Session] {
@@ -885,7 +911,7 @@ final class PillView: NSView {
             min(ceil(label(s).size().width), expanded ? 520 : 340) + ceil(timeLabel(s)?.size().width ?? 0)
         }.max() ?? 0
         var width = padX * 2 + mark + gap + widest + extrasWidth
-        if shown.contains(where: dismissible) { width += checkWidth }
+        if shown.contains(where: hasButton) { width += checkWidth }
         width = (width / 16).rounded(.up) * 16     // fewer resizes as the text changes
         let more = CGFloat(max(shown.count - 1, 0))
         let height = firstRowHeight + more * rowHeight + (more > 0 ? 8 : 0)
@@ -1106,16 +1132,24 @@ final class PillView: NSView {
                 NSRect(x: textX, y: y + (i == 1 ? 3 : 0), width: p.maxX - padX - textX, height: 1).fill()
             }
             var trailing = i == 0 ? extrasWidth : 0
-            if dismissible(s) {
-                // "Viewed" tick: click to clear this finished row.
+            if hasButton(s) {
+                // Finished rows: a "viewed" tick that clears the row. Working or waiting rows: a × that
+                // hides the row until its state changes.
                 trailing += checkWidth
                 let r = NSRect(x: p.maxX - padX - 15 + 3, y: y + (h - 15) / 2 + (i == 1 ? 1.5 : 0), width: 15, height: 15)
-                NSColor(white: 1, alpha: 0.12).setFill()
+                let hot = hoverButton == s.id
+                NSColor(white: 1, alpha: hot ? 0.24 : 0.12).setFill()
                 NSBezierPath(ovalIn: r).fill()
                 let tick = NSBezierPath()
-                tick.move(to: NSPoint(x: r.minX + 4.4, y: r.minY + 7.8))
-                tick.line(to: NSPoint(x: r.minX + 6.6, y: r.minY + 10))
-                tick.line(to: NSPoint(x: r.minX + 10.6, y: r.minY + 5.2))
+                if dismissible(s) {
+                    tick.move(to: NSPoint(x: r.minX + 4.4, y: r.minY + 7.8))
+                    tick.line(to: NSPoint(x: r.minX + 6.6, y: r.minY + 10))
+                    tick.line(to: NSPoint(x: r.minX + 10.6, y: r.minY + 5.2))
+                } else {
+                    let c = NSPoint(x: r.midX, y: r.midY), d: CGFloat = 2.6
+                    tick.move(to: NSPoint(x: c.x - d, y: c.y - d)); tick.line(to: NSPoint(x: c.x + d, y: c.y + d))
+                    tick.move(to: NSPoint(x: c.x + d, y: c.y - d)); tick.line(to: NSPoint(x: c.x - d, y: c.y + d))
+                }
                 tick.lineWidth = 1.4
                 tick.lineCapStyle = .round
                 tick.lineJoinStyle = .round
@@ -1150,14 +1184,16 @@ final class PillView: NSView {
 
     override func mouseEntered(with event: NSEvent) { if dragStart == nil { onHover?(true) } }
     override func mouseExited(with event: NSEvent) {
+        hoverButton = nil
         setHover(nil)
         if dragStart == nil { onHover?(false) }
     }
     override func mouseMoved(with event: NSEvent) {
         guard dragStart == nil else { return }
         let p = convert(event.locationInWindow, from: nil)
-        let onTick = checkRects.contains { $0.rect.insetBy(dx: -5, dy: -5).contains(p) }
-        setHover(onTick ? nil : rowRects.first { $0.rect.contains(p) }?.id)
+        let button = checkRects.first { $0.rect.insetBy(dx: -5, dy: -5).contains(p) }?.id
+        if hoverButton != button { hoverButton = button; needsDisplay = true }
+        setHover(button != nil ? nil : rowRects.first { $0.rect.contains(p) }?.id)
     }
     private func setHover(_ id: String?) {
         guard hoverRow != id else { return }
@@ -1302,8 +1338,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.onDrag = { [weak self] offset in self?.drag(offset) }
         view.menuProvider = { [weak self] in self?.makeMenu() ?? NSMenu() }
         view.onDismiss = { [weak self] id in
-            guard let self, self.store.remove(id) else { return }
-            self.titleChecked[id] = nil
+            guard let self, let s = self.store.sessions[id] else { return }
+            if s.state == .done || s.state == .idle {
+                guard self.store.remove(id) else { return }
+                self.titleChecked[id] = nil
+            } else {
+                guard self.store.hide(id) else { return }
+            }
             self.changed()
         }
         view.onOpen = { [weak self] id in
@@ -1392,6 +1433,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case "_Snapshot": snapshot(event)
         case "_ChatDump": chatDump(event)
         case "_AXProbe": axProbe(event)
+        case "_Hide":  // debug aid: {"hook_event_name":"_Hide","label":"<row label>"} presses that row's ×/tick
+            if let label = event["label"] as? String, let s = store.ordered.first(where: { $0.label == label }) {
+                view.onDismiss?(s.id)
+            }
+        case "_ShowHidden": showHidden()
         case "_Spaces":  // debug aid: {"hook_event_name":"_Spaces","path":"..","break":true} reports (or, for
                          // testing, breaks) the pill's Space membership the way macOS sometimes does
             if event["break"] as? Bool == true { SpaceCheck.dropAllBut(windowNumber: panel.windowNumber, screen: panel.screen) }
@@ -1733,8 +1779,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let bar = f.maxY - screen.visibleFrame.maxY
         view.barHeight = bar > 20 ? bar : NSStatusBar.system.thickness
         view.docked = docked
+        store.pruneHidden()
         view.rows = store.ordered
-        let alert = alertFor(view.rows)
+        // Alerts look at hidden sessions too, so a hidden agent that starts waiting still chimes.
+        let alert = alertFor(store.ordered + store.hidden.keys.compactMap { store.sessions[$0] })
         for s in view.rows where !s.id.hasPrefix("_") { history[s.id] = s }
         if history.count > 24, let oldest = history.values.min(by: { $0.updated < $1.updated }) {
             history[oldest.id] = nil
@@ -1806,6 +1854,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.state = defaults.bool(forKey: key) ? .on : .off
         }
         menu.addItem(.separator())
+        store.pruneHidden()
+        if !store.hidden.isEmpty {
+            let n = store.hidden.count
+            menu.addItem(withTitle: "Show \(n) Hidden Session\(n == 1 ? "" : "s")", action: #selector(showHidden),
+                         keyEquivalent: "").target = self
+        }
         for (title, action) in [("Reset Position", #selector(resetPosition)),
                                 ("Clear Chats", #selector(clearChats)),
                                 ("Quit", #selector(quit))] {
@@ -1880,6 +1934,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         layout(animated: true)
     }
     /// Clears every row from the pill. Sessions stay listed under recent sessions in the menu.
+    @objc private func showHidden() {
+        if store.showHidden() { changed() }
+    }
     @objc private func clearChats() {
         store.clearAll()
         changed()

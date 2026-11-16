@@ -8,7 +8,8 @@ terminal or editor, Code sessions in the Claude desktop app, and Claude desktop 
 - **Blue spinner**: working, with time on the current step ("Running tests · 4m").
 - **Amber dot**: needs you. The pill bounces and plays a soft chime.
 - **Green dot**: done.
-- Hover to see every session. Click a row to jump to that session or chat.
+- Hover to see every session. Click a row to jump to that session or chat. Click × to hide a working or
+  waiting session; it comes back when its state changes (for example, when it needs you).
 
 It uses no model tokens. It listens to Claude Code hooks and, optionally, reads the Claude desktop window
 through Accessibility.

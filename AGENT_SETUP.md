@@ -13,6 +13,8 @@ anywhere). It shows what each running Claude agent is doing:
 - **Amber dot**: needs the person (a permission prompt, a question, an error). The pill bounces and plays a soft
   chime.
 - **Green dot**: finished. Click the tick to clear it.
+- While hovering, working and waiting rows show a **×** that hides that session until its state changes (a hidden
+  agent that starts waiting comes back, with the chime). "Show Hidden Sessions" in the menu brings them all back.
 
 Hovering expands the pill to show every session. Clicking a row takes the person to that session:
 
@@ -181,7 +183,7 @@ from the Accessibility list.
   - `AppDelegate`: layout, click-to-open (`focus`), chimes and bounce, menu.
 - `Sources/hook.c` is `pill-hook`.
 - `build.sh` and `make-cert.sh` are described above.
-- Debug events sent through `pill-hook hook`: `_Snapshot`, `_ChatDump`, `_AXProbe`, `_Open`, `_Click`, `_Spaces`.
+- Debug events sent through `pill-hook hook`: `_Snapshot`, `_ChatDump`, `_AXProbe`, `_Open`, `_Click`, `_Spaces`, `_Hide`, `_ShowHidden`.
 
 ## Rules for you, the agent
 
