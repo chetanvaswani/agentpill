@@ -1279,13 +1279,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                                object: nil, queue: .main) { [weak self] _ in
             self?.layout(animated: false)
         }
-        // .canJoinAllSpaces alone doesn't carry the panel into full-screen Spaces created or entered
-        // after it was shown; re-ordering it on every Space or app switch does.
+        // .canJoinAllSpaces doesn't carry the panel into full-screen Spaces: it only joins the Spaces
+        // that were active when it was ordered in, and ordering an already-visible window to the front
+        // doesn't add the current one. Hiding and re-showing it while the new Space is active does.
         let ws = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.activeSpaceDidChangeNotification, NSWorkspace.didActivateApplicationNotification] {
-            ws.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                guard let self, self.panel.isVisible else { return }
-                self.panel.orderFrontRegardless()
+            ws.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                self?.followSpace(note.name.rawValue)
             }
         }
 
@@ -1582,6 +1582,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let origin = dragOrigin else { return }
         anchor = NSPoint(x: origin.x + offset.x, y: origin.y + offset.y)
         layout(animated: false)
+    }
+
+    /// Brings the pill onto the Space that just became active (see the observer in launch).
+    private func followSpace(_ why: String, retry: Bool = true) {
+        guard panel.isVisible else { return }
+        let before = panel.isOnActiveSpace
+        if !before {
+            let alpha = panel.alphaValue
+            panel.orderOut(nil)
+            panel.orderFrontRegardless()
+            panel.alphaValue = alpha
+        }
+        spaceLog("\(why) onActive=\(before) -> \(panel.isOnActiveSpace)")
+        // Full-screen transitions can still be animating when the notification arrives.
+        if retry {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                self?.followSpace("retry", retry: false)
+            }
+        }
+    }
+
+    private func spaceLog(_ line: String) {
+        let url = URL(fileURLWithPath: supportDir + "/spaces.log")
+        let entry = ISO8601DateFormatter().string(from: Date()) + " " + line + "\n"
+        if let h = try? FileHandle(forWritingTo: url),
+           (try? h.seekToEnd()).map({ $0 < 200_000 }) ?? false {
+            h.write(entry.data(using: .utf8)!); try? h.close()
+        } else {
+            try? entry.write(to: url, atomically: true, encoding: .utf8)
+        }
     }
 
     private func layout(animated: Bool) {
