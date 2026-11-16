@@ -147,6 +147,15 @@ General → Login Items**.
   ```
   If the Claude window is on another Space or in full screen, macOS hides it from Accessibility, and the dump
   lists no windows.
+- **Pill doesn't follow to other desktops or full-screen apps.** macOS sometimes drops an "all Spaces" window
+  from some Spaces (seen after sleep and display changes), and only a new window rejoins them. The app checks every
+  2 seconds and on every Space switch, and swaps in a fresh window when needed; each swap is logged in
+  `~/.agentpill/spaces.log`. To see which Spaces the pill is on right now:
+  ```bash
+  echo '{"hook_event_name":"_Spaces","path":"/tmp/agentpill-spaces.txt"}' \
+    | ~/Applications/AgentPill.app/Contents/MacOS/pill-hook hook; sleep 0.5; cat /tmp/agentpill-spaces.txt
+  ```
+  `mine=` should list every id in `all=`.
 - **Pill is off-screen or in a strange place.** Use Reset Position in the menu bar icon's menu.
 - **Nothing happens on launch.** Only one copy runs at a time. `pkill -x AgentPill` and open it again.
 
@@ -172,7 +181,7 @@ from the Accessibility list.
   - `AppDelegate`: layout, click-to-open (`focus`), chimes and bounce, menu.
 - `Sources/hook.c` is `pill-hook`.
 - `build.sh` and `make-cert.sh` are described above.
-- Debug events sent through `pill-hook hook`: `_Snapshot`, `_ChatDump`, `_AXProbe`, `_Open`, `_Click`.
+- Debug events sent through `pill-hook hook`: `_Snapshot`, `_ChatDump`, `_AXProbe`, `_Open`, `_Click`, `_Spaces`.
 
 ## Rules for you, the agent
 

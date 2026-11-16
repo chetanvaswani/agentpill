@@ -1196,6 +1196,63 @@ final class PillView: NSView {
     }
 }
 
+/// Read-only check of which Spaces a window is on, through WindowServer calls that have no public
+/// equivalent. They're looked up at run time, so if a future macOS drops them the check just reports
+/// nothing missing and the pill falls back to NSWindow.isOnActiveSpace.
+enum SpaceCheck {
+    private typealias MainConn = @convention(c) () -> Int32
+    private typealias CopyDisplaySpaces = @convention(c) (Int32) -> Unmanaged<CFArray>?
+    private typealias CopyWindowSpaces = @convention(c) (Int32, Int32, CFArray) -> Unmanaged<CFArray>?
+    private static let handle = dlopen(nil, RTLD_NOW)
+    private static func sym<T>(_ name: String, _: T.Type) -> T? {
+        dlsym(handle, name).map { unsafeBitCast($0, to: T.self) }
+    }
+    private static let conn = sym("CGSMainConnectionID", MainConn.self)
+    private static let displaySpaces = sym("CGSCopyManagedDisplaySpaces", CopyDisplaySpaces.self)
+    private static let windowSpaces = sym("CGSCopySpacesForWindows", CopyWindowSpaces.self)
+
+    /// User desktops and full-screen Spaces on the display showing `screen`.
+    static func spaces(on screen: NSScreen?) -> Set<Int> {
+        guard let conn, let displaySpaces, let list = displaySpaces(conn())?.takeRetainedValue()
+                as? [[String: Any]] else { return [] }
+        var display: [String: Any]? = list.count == 1 ? list[0] : nil
+        if display == nil, let n = screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+           let uuid = CGDisplayCreateUUIDFromDisplayID(n.uint32Value)?.takeRetainedValue(),
+           let str = CFUUIDCreateString(nil, uuid) as String? {
+            display = list.first { ($0["Display Identifier"] as? String)?.caseInsensitiveCompare(str) == .orderedSame }
+        }
+        let entries = display?["Spaces"] as? [[String: Any]] ?? []
+        return Set(entries.compactMap { e in
+            guard let type = e["type"] as? Int, type == 0 || type == 4 else { return nil }
+            return e["ManagedSpaceID"] as? Int
+        })
+    }
+
+    static func spaces(ofWindow number: Int) -> Set<Int>? {
+        guard let conn, let windowSpaces,
+              let list = windowSpaces(conn(), 7, [number] as CFArray)?.takeRetainedValue() as? [Int] else { return nil }
+        return Set(list)
+    }
+
+    /// Testing only: removes the window from every Space except the active one (or the first desktop).
+    static func dropAllBut(windowNumber: Int, screen: NSScreen?) {
+        typealias Remove = @convention(c) (Int32, CFArray, CFArray) -> Void
+        typealias Active = @convention(c) (Int32) -> UInt64
+        guard let conn, let remove = sym("CGSRemoveWindowsFromSpaces", Remove.self),
+              let current = sym("CGSGetActiveSpace", Active.self) else { return }
+        let keep = Int(current(conn()))
+        let drop = spaces(on: screen).filter { $0 != keep }
+        remove(conn(), [windowNumber] as CFArray, Array(drop) as CFArray)
+    }
+
+    /// How many of the screen's Spaces the window is missing from (0 when it can't tell).
+    static func missing(windowNumber: Int, screen: NSScreen?, ignoring: Set<Int> = []) -> Int {
+        let all = spaces(on: screen).subtracting(ignoring)
+        guard !all.isEmpty, let mine = spaces(ofWindow: windowNumber), !mine.isEmpty else { return 0 }
+        return all.subtracting(mine).count
+    }
+}
+
 final class PillPanel: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
@@ -1213,6 +1270,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var server: Server?
     private var watcher: ChatWatcher?
     private var panel: PillPanel!
+    private var spaceTimer: Timer?
+    private var unjoinable: Set<Int> = []
     private var view: PillView!
     private var sweepTimer: Timer?
     private var clockTimer: Timer?
@@ -1263,30 +1322,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusMenu.delegate = self
         statusItem.menu = statusMenu
 
-        panel = PillPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
-                          backing: .buffered, defer: false)
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = false
-        panel.level = .statusBar
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
-        panel.hidesOnDeactivate = false
-        panel.isMovable = false
-        panel.contentView = view
+        panel = makePanel()
         layout(animated: false)
 
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                object: nil, queue: .main) { [weak self] _ in
             self?.layout(animated: false)
         }
-        // .canJoinAllSpaces doesn't carry the panel into full-screen Spaces: it only joins the Spaces
-        // that were active when it was ordered in, and ordering an already-visible window to the front
-        // doesn't add the current one. Hiding and re-showing it while the new Space is active does.
+        // Keep the pill on every Space. See SpaceCheck for why this is needed.
         let ws = NSWorkspace.shared.notificationCenter
-        for name in [NSWorkspace.activeSpaceDidChangeNotification, NSWorkspace.didActivateApplicationNotification] {
+        for name in [NSWorkspace.activeSpaceDidChangeNotification, NSWorkspace.didActivateApplicationNotification,
+                     NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification,
+                     NSWorkspace.sessionDidBecomeActiveNotification] {
             ws.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
-                self?.followSpace(note.name.rawValue)
+                self?.followSpaces(note.name.rawValue)
+                // Space membership settles a moment after the switch animation.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self?.followSpaces("settle") }
             }
+        }
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.followSpaces("screens")
+        }
+        // Spaces can also be added without any notification here (another app entering full screen
+        // while the pill is hidden, displays reconnecting); a cheap periodic check catches those.
+        spaceTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            self?.followSpaces(nil)
         }
 
         let server = Server { [weak self] event in self?.receive(event) }
@@ -1331,6 +1392,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case "_Snapshot": snapshot(event)
         case "_ChatDump": chatDump(event)
         case "_AXProbe": axProbe(event)
+        case "_Spaces":  // debug aid: {"hook_event_name":"_Spaces","path":"..","break":true} reports (or, for
+                         // testing, breaks) the pill's Space membership the way macOS sometimes does
+            if event["break"] as? Bool == true { SpaceCheck.dropAllBut(windowNumber: panel.windowNumber, screen: panel.screen) }
+            if let path = event["path"] as? String {
+                let all = SpaceCheck.spaces(on: panel.screen).sorted(), mine = (SpaceCheck.spaces(ofWindow: panel.windowNumber) ?? []).sorted()
+                try? "window=\(panel.windowNumber) visible=\(panel.isVisible) onActive=\(panel.isOnActiveSpace) viewInPanel=\(view.window === panel) tracking=\(view.trackingAreas.count) all=\(all) mine=\(mine)\n"
+                    .write(toFile: path, atomically: true, encoding: .utf8)
+            }
         case "_Click":  // debug aid: {"hook_event_name":"_Click","label":"<row label>"} runs a row click
             if let label = event["label"] as? String, let s = store.ordered.first(where: { $0.label == label }) { focus(s) }
         case "_Open":   // debug aid: {"hook_event_name":"_Open","path":..,"mode":"Code","title":".."}
@@ -1584,23 +1653,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         layout(animated: false)
     }
 
-    /// Brings the pill onto the Space that just became active (see the observer in launch).
-    private func followSpace(_ why: String, retry: Bool = true) {
-        guard panel.isVisible else { return }
-        let before = panel.isOnActiveSpace
-        if !before {
-            let alpha = panel.alphaValue
-            panel.orderOut(nil)
-            panel.orderFrontRegardless()
-            panel.alphaValue = alpha
+    private func makePanel() -> PillPanel {
+        let p = PillPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
+                          backing: .buffered, defer: false)
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = false
+        p.level = .statusBar
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        p.hidesOnDeactivate = false
+        p.isMovable = false
+        p.isReleasedWhenClosed = false
+        p.contentView = view
+        return p
+    }
+
+    /// Makes sure the visible pill is on the active Space and, where macOS lets us check, on every Space.
+    /// macOS sometimes drops a .canJoinAllSpaces window from Spaces (seen after sleep and display
+    /// changes), and nothing public re-adds it: ordering out and in, or resetting the collection behaviour,
+    /// leaves it stuck. A new window joins every Space, so the pill swaps in a fresh one.
+    private func followSpaces(_ why: String?) {
+        guard panel.isVisible, dragOrigin == nil else { return }
+        let onActive = panel.isOnActiveSpace
+        let missing = SpaceCheck.missing(windowNumber: panel.windowNumber, screen: panel.screen, ignoring: unjoinable)
+        guard !onActive || missing > 0 else { return }
+        renewPanel()
+        // A Space that even a fresh window doesn't join can't be fixed this way; remember it so the
+        // check doesn't keep renewing for it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            guard let self, self.panel.isVisible else { return }
+            let all = SpaceCheck.spaces(on: self.panel.screen)
+            self.unjoinable = all.subtracting(SpaceCheck.spaces(ofWindow: self.panel.windowNumber) ?? all)
         }
-        spaceLog("\(why) onActive=\(before) -> \(panel.isOnActiveSpace)")
-        // Full-screen transitions can still be animating when the notification arrives.
-        if retry {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-                self?.followSpace("retry", retry: false)
-            }
-        }
+        let fixed = panel.isOnActiveSpace
+        spaceLog("\(why ?? "timer") onActive=\(onActive) missing=\(missing) -> renewed, onActive=\(fixed)")
+    }
+
+    private func renewPanel() {
+        let old = panel!
+        let frame = old.frame
+        old.contentView = NSView()
+        let fresh = makePanel()
+        fresh.setFrame(frame, display: false)
+        fresh.alphaValue = 1    // a fade still running on the old window wouldn't carry over
+        panel = fresh
+        fresh.orderFrontRegardless()
+        old.orderOut(nil)
+        old.close()
+        view.updateTrackingAreas()
+        layout(animated: false)
     }
 
     private func spaceLog(_ line: String) {
@@ -1666,6 +1767,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if wasHidden {
             panel.alphaValue = 0
             panel.orderFrontRegardless()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.followSpaces("show") }
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.25
                 panel.animator().alphaValue = 1
